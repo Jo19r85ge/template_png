@@ -1,0 +1,238 @@
+Vale, te documento **todo el proceso de la POC 1** (la que ya tienes: **Journey → obtener OAuth token (client_credentials) con Cache Manager → llamar a wrapper → enrutar found/notFound/error y guardar atributos**).
+
+Lo dejo como si fuera para entregarlo a tu equipo: **objetivos + pasos + criterios de éxito + evidencias/logs** y con **citas** de la documentación oficial / PDFs que has subido.
+
+---
+
+# POC 1 — Journey que consulta un wrapper externo con OAuth2 Client Credentials + Cache Manager
+
+## 1) Objetivo de la POC
+
+**Objetivo principal**
+Demostrar que una **Journey** en PingOne Advanced Identity Cloud puede **consultar un endpoint externo** (wrapper/back) de forma segura y eficiente, usando:
+
+* **OAuth 2.0 Client Credentials** para obtener `access_token`.
+* **Cache Manager** para **evitar pedir el token en cada ejecución** (se reutiliza mientras sea válido).
+* **Librería (library script)** para reutilizar la obtención del token y la llamada (opción A).
+* **Scripted Decision Node** para tomar decisiones del flujo (`found`, `notFound`, `error`) y guardar datos en `nodeState`.
+
+Esto encaja con el modelo de **next-generation scripts**, donde puedes modularizar con **library scripts** (CommonJS `require`) y usar bindings modernos como `httpClient`, `nodeState`, `systemEnv`, etc. 
+
+---
+
+## 2) Alcance
+
+### Dentro de la POC (sí)
+
+* Obtener token mediante **client_credentials**.
+* Guardar token en **cache global** (Cache Manager).
+* Ejecutar búsqueda por **mail** (y dejar preparado para alias/documento/mobile).
+* Parsear respuesta (`resultCount`, `result[0]...`) y guardar atributos relevantes en `nodeState`.
+* Enrutar a outcomes: `found` / `notFound` / `error`.
+* Usar **ESVs** para no hardcodear URLs/IDs/secrets.
+
+Los ESVs se gestionan desde consola (Tenant Settings → Global Settings → Environment Secrets & Variables) y existen como mecanismo para separar configuración por entornos y proteger secretos.
+
+### Fuera de la POC (no)
+
+* Refresh token (no aplica en client_credentials típico).
+* Custom Node empaquetado/exportado.
+* Rotación/gestión avanzada de secretos más allá de ESV.
+
+---
+
+## 3) Requisitos previos
+
+1. **Tenant AIC** (dev) con permisos para crear scripts/journeys y ESVs.
+2. Endpoint del wrapper accesible desde AIC (red/TLS/allowlist si aplica).
+3. Credenciales OAuth2 del wrapper (client_id/client_secret) y token endpoint.
+4. Conocer bindings disponibles en scripts (por ejemplo `systemEnv.getProperty()` para ESVs y `httpClient.send(...)`).
+
+---
+
+## 4) Artefactos de la POC (qué se crea)
+
+### A) ESVs (Variables/Secrets)
+
+* **Variables** (no sensibles): URLs, baseUrl, etc.
+* **Secrets** (sensibles): `client_secret`, etc.
+
+Ping recomienda **guardar datos sensibles en secretos** y no embebidos en scripts/configuración. 
+Y explica cómo crear y gestionar variables/secrets en consola.
+
+Ejemplo de ESVs (nombres orientativos):
+
+* `esv.url.oauth.token` (Variable): token endpoint
+* `esv.client.id.wrapper` (Variable): client_id
+* `esv.client.secret.wrapper` (Secret): client_secret
+* `esv.url.wrapper.base` (Variable): baseUrl del wrapper
+
+### B) Cache Manager
+
+* Cache: `oauthTokenCache`
+* Script de cache load/reload: `test_get_oauth_cache` (lo que ya tienes).
+
+### C) Scripts (Next-gen)
+
+* Library script: `test_library_get_oauth_token` (lo que ya tienes).
+* Library script (nuevo, opción A): `test_library_identity_discover` (la que encapsula la llamada al wrapper).
+* Decision node script: `test_gidFindByEmailLDAP` (muy fino: solo orquesta).
+
+Next-gen scripts permiten modularizar con **library scripts** reusables como módulos CommonJS (`require`). 
+
+---
+
+## 5) Diseño del flujo (arquitectura)
+
+### Flujo lógico (runtime)
+
+1. Journey llega al **Scripted Decision Node**.
+2. El nodo:
+
+   * obtiene `mail` desde `objectAttributes`
+   * llama a la librería `identity_discover`
+3. La librería:
+
+   * usa `systemEnv.getProperty(...)` para leer ESVs (URLs/IDs/secrets)
+   * obtiene token vía `cacheManager.named(cacheName).get(cacheKey)`
+   * hace HTTP GET al wrapper usando `httpClient.send(...).get()` 
+4. El nodo decide outcome:
+
+   * `found` si `resultCount > 0`
+   * `notFound` si `resultCount = 0`
+   * `error` si status != 200 o excepción
+
+---
+
+## 6) Pasos detallados (implementación)
+
+### Paso 1 — Crear ESVs en la consola
+
+En AIC Admin Console:
+`Tenant Settings → Global Settings → Environment Secrets & Variables`
+
+Crear:
+
+* Variables (URLs/IDs)
+* Secret (client_secret)
+
+La doc detalla el flujo de creación y que el nombre no se puede modificar después. 
+
+**Criterio de éxito**
+
+* ESVs visibles en consola y con valores correctos.
+
+---
+
+### Paso 2 — Configurar Cache Manager para el token
+
+Crear un Cache Manager con cache `oauthTokenCache` y un script `load(key)` (tu `test_get_oauth_cache`) que haga:
+
+* `POST` al token endpoint con `grant_type=client_credentials`
+* devuelva el JSON (incluyendo `access_token`)
+
+**Por qué es clave**
+Esto evita pedir token en cada journey y centraliza la obtención.
+
+---
+
+### Paso 3 — Library script para obtener token del cache
+
+Tu librería `test_library_get_oauth_token`:
+
+* construye un `cacheKey` con `url/clientId/clientSecret`
+* hace `cacheManager.named(cacheName).get(cacheKey)`
+* guarda `accessToken` en `nodeState`
+
+Esto es coherente con la idea de **simplificar y modularizar** scripts con library scripts en next-gen. 
+
+---
+
+### Paso 4 — Library script “identity_discover” (Opción A)
+
+Crear `test_library_identity_discover` que:
+
+* recibe `tipo` + `valor` (mail/alias/documento/mobile)
+* llama a `obtenerToken(...)`
+* construye `_queryFilter`
+* llama al wrapper con `httpClient.send(...).get()`
+
+El binding `httpClient` y su patrón de uso (sync con `.get()`) está documentado. 
+Y `systemEnv.getProperty()` para leer ESVs también.
+
+---
+
+### Paso 5 — Decision Node mínimo (orquestación)
+
+El script `test_gidFindByEmailLDAP`:
+
+* lee `mail` de `objectAttributes`
+* llama a `identityLib.buscarUsuario(...)`
+* mapea `result[0]` a `nodeState.putShared(...)`
+* decide `action.goTo("found"|"notFound"|"error")`
+
+---
+
+### Paso 6 — Crear la Journey (POC 1)
+
+Journey mínima recomendada:
+
+1. **Start**
+2. (Opcional) **Debug node** para ver atributos/outputs en `nodeState` (útil en POC). La doc sugiere Debug node para verificar valores en nodeState. 
+3. **Scripted Decision Node** con outcomes:
+
+   * `found`
+   * `notFound`
+   * `error`
+4. Tres ramas a:
+
+   * Page/Message/Success según el caso (lo que use tu POC)
+
+---
+
+## 7) Criterios de éxito (qué tiene que demostrar)
+
+1. **Token caching**
+
+* Primera ejecución: se pide token.
+* Siguientes ejecuciones: se reutiliza token desde cache (mismo `cacheKey`).
+
+2. **Consulta wrapper OK**
+
+* Con email existente → outcome `found`
+* Con email inexistente → `notFound`
+* Con token inválido/caducado → `error` con `errorCode=401` y `errorMessage` correcto.
+
+3. **Datos guardados en nodeState**
+
+* `resultCount`
+* `userId`, `userMail`, `userGivenName`, etc.
+
+4. **No hardcode de secretos**
+
+* URL/IDs/secret vienen de ESVs, recomendado por seguridad.
+
+---
+
+## 8) Evidencias y troubleshooting (para entregar)
+
+### Evidencia A — Debug node / logs
+
+* En `found`: `resultCount`, `userId`, `userMail`, etc.
+* En `error`: `errorCode`, `errorMessage`, `responseBody` (si procede)
+
+### Evidencia B — Prueba de `httpClient`
+
+El patrón `httpClient.send(url, options).get()` y el check de `response.status` es el recomendado en ejemplos. 
+
+---
+
+## 9) Riesgos conocidos y mitigación
+
+* **PII en ESVs**: no guardar PII en ESVs; ESVs son para configuración y secretos, no datos de usuario. 
+* **Secret en script**: evitar meter `client_secret` hardcoded; usar ESV secret.
+* **Errores de red / TLS**: si hay problemas, capturar excepción (ya lo haces con `catch`) y enrutar a `error`.
+
+---
+
+Si me dices qué “POC 1” necesitas exactamente en formato entregable (por ejemplo: **Confluence**, **Word**, o **Markdown**) te lo dejo con portada, diagrama y checklist para firmar (“Definition of Done”).
